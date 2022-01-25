@@ -71,6 +71,7 @@ pub(crate) struct PluginLibrary {
     pub(crate) loaded_library: Library,
 }
 
+#[derive(Default)]
 pub struct PluginManager {
     plugins: Vec<PluginLibrary>,
 }
