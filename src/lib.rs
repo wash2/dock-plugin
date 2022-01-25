@@ -6,7 +6,7 @@ use gtk4_sys::GtkWidget;
 use libloading::{Library, Symbol};
 use log::{debug, trace};
 use std::any::Any;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 
 /// A plugin which allows you to add extra functionality to the cosmic dock/panel.
 pub trait Plugin: Any + Send + Sync {
@@ -66,6 +66,7 @@ macro_rules! declare_plugin {
 }
 
 pub(crate) struct PluginLibrary {
+    pub(crate) filename: OsString,
     pub(crate) plugin: Box<dyn Plugin>,
     pub(crate) applet: gtk4::Box,
     pub(crate) loaded_library: Library,
@@ -83,7 +84,10 @@ impl PluginManager {
         }
     }
 
-    pub unsafe fn load_plugin<P: AsRef<OsStr>>(&mut self, filename: P) -> Result<()> {
+    pub unsafe fn load_plugin<P: AsRef<OsStr> + Into<OsString>>(
+        &mut self,
+        filename: P,
+    ) -> Result<()> {
         type PluginCreate = unsafe fn() -> *mut dyn Plugin;
         type GetApplet = unsafe fn() -> *const GtkWidget;
 
@@ -109,6 +113,7 @@ impl PluginManager {
         };
 
         self.plugins.push(PluginLibrary {
+            filename: filename.into(),
             plugin,
             applet,
             loaded_library: lib,
@@ -123,6 +128,7 @@ impl PluginManager {
         debug!("Unloading plugins");
 
         for PluginLibrary {
+            filename: _,
             plugin,
             applet,
             loaded_library,
@@ -138,6 +144,10 @@ impl PluginManager {
 
     pub fn applets(&self) -> Vec<&gtk4::Box> {
         self.plugins.iter().map(|p| &p.applet).collect()
+    }
+
+    pub fn filenames(&self) -> Vec<OsString> {
+        self.plugins.iter().map(|p| p.filename.clone()).collect()
     }
 }
 
