@@ -3,12 +3,12 @@ use anyhow::{anyhow, Result};
 use futures::{channel::mpsc::Receiver, SinkExt};
 use glib::translate::ToGlibPtr;
 use gtk4::glib::object::Cast;
+use gtk4::prelude::ObjectExt;
 use gtk4::{glib, CssProvider, Orientation};
 use libloading::{Library, Symbol};
 use log::debug;
 use notify::{Event, INotifyWatcher, RecursiveMode, Watcher};
 use regex::Regex;
-use std::any::Any;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,18 +26,9 @@ pub trait Plugin {
     fn css_provider(&mut self) -> CssProvider {
         CssProvider::new()
     }
-    fn applet_ptr(&mut self) -> *const gtk4_sys::GtkBox {
-        let boxed: std::boxed::Box<gtk4::Box> = std::boxed::Box::new(self.applet());
-        unsafe {
-            let b: gtk4::glib::translate::Stash<'static, *const gtk4_sys::GtkBox, gtk4::Box> =
-                std::boxed::Box::into_raw(boxed)
-                    .as_ref()
-                    .unwrap()
-                    .to_glib_none();
-            b.0
-        }
+    fn applet_ptr(&mut self) -> *mut gtk4_sys::GtkBox {
+        self.applet().to_glib_full()
     }
-
     fn css_provider_ptr(&mut self) -> *mut gtk4_sys::GtkCssProvider {
         self.css_provider().to_glib_full()
     }
@@ -88,9 +79,9 @@ impl<'a> Drop for PluginLibrary<'a> {
             loaded_library,
         } = self;
         plugin.on_plugin_unload();
+        drop(applet);
         drop(name);
         drop(filename);
-        drop(applet);
         drop(css_provider);
         drop(plugin);
         // XXX must be dropped last
@@ -160,7 +151,7 @@ impl<'a> PluginManager<'a> {
         // let get_applet: Symbol<GetApplet> = lib.get(b"_applet")?;
         let applet = plugin.applet_ptr();
         let applet: gtk4::Box = if !applet.is_null() {
-            gtk4::glib::translate::from_glib_none::<_, gtk4::Box>(applet).unsafe_cast()
+            gtk4::glib::translate::from_glib_full::<_, gtk4::Box>(applet).unsafe_cast()
         } else {
             gtk4::Box::new(Orientation::Vertical, 0)
         };
@@ -182,12 +173,12 @@ impl<'a> PluginManager<'a> {
             loaded_library: lib,
         });
         self.watching.push((name.into(), lib_path));
-
         let PluginLibrary {
             applet,
             css_provider,
             ..
         } = self.plugins.last().unwrap();
+
         Ok((applet, css_provider))
     }
 
@@ -206,18 +197,14 @@ impl<'a> PluginManager<'a> {
         }
     }
 
-    pub fn applets(&self) -> Vec<&gtk4::Box> {
-        self.plugins.iter().map(|p| &p.applet).collect()
-    }
-
     pub fn paths(&self) -> Vec<OsString> {
         self.plugins.iter().map(|p| p.lib_path.clone()).collect()
     }
 
-    pub fn library_path_to_applet<T: AsRef<OsStr>>(&self, lib_filename: T) -> Option<gtk4::Box> {
+    pub fn library_path_to_applet<T: AsRef<OsStr>>(&self, lib_filename: T) -> Option<&gtk4::Box> {
         self.plugins.iter().find_map(move |p| {
             if p.lib_path.as_os_str() == lib_filename.as_ref() {
-                Some(p.applet.clone())
+                Some(&p.applet)
             } else {
                 None
             }
@@ -275,7 +262,6 @@ pub fn get_ld_path<T: AsRef<Path>>(lib_name: T) -> Option<PathBuf> {
     for mut path in ld_library_dirs {
         path.push(&filename);
         if path.exists() {
-            dbg!(&path);
             return Some(path);
         }
     }
@@ -296,7 +282,6 @@ pub fn get_ld_path<T: AsRef<Path>>(lib_name: T) -> Option<PathBuf> {
                     .ok_or(anyhow!("no match"))
             })
         {
-            dbg!(&cap);
             return Some(cap.into());
         }
     }
