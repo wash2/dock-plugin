@@ -18,19 +18,24 @@ use thin_trait_object::*;
 
 #[thin_trait_object(drop_abi = "C")]
 pub trait Plugin {
-    /// Get a name describing the `Plugin`.
-    fn name(&self) -> &'static str;
+    extern "C" fn _applet(&mut self) -> *mut gtk4_sys::GtkBox {
+        self.applet().to_glib_full()
+    }
+    extern "C" fn _css_provider(&mut self) -> *mut gtk4_sys::GtkCssProvider {
+        self.css_provider().to_glib_full()
+    }
+    extern "C" fn _on_plugin_load(&mut self) {
+        self.on_plugin_load();
+    }
+    extern "C" fn _on_plugin_unload(&mut self) {
+        self.on_plugin_unload();
+    }
+
     /// Get the applet
     fn applet(&mut self) -> gtk4::Box;
     /// get the css provider
     fn css_provider(&mut self) -> CssProvider {
         CssProvider::new()
-    }
-    fn applet_ptr(&mut self) -> *mut gtk4_sys::GtkBox {
-        self.applet().to_glib_full()
-    }
-    fn css_provider_ptr(&mut self) -> *mut gtk4_sys::GtkCssProvider {
-        self.css_provider().to_glib_full()
     }
     /// A callback fired immediately after the plugin is loaded. Usually used
     /// for initialization.
@@ -144,12 +149,11 @@ impl<'a> PluginManager<'a> {
         let boxed_raw = constructor();
 
         let mut plugin = BoxedPlugin::from_raw(boxed_raw as *mut ());
-        debug!("Loaded plugin: {}", plugin.name());
         plugin.on_plugin_load();
 
         // XXX gtk needs to be initialized before loading applet and css provider
         // let get_applet: Symbol<GetApplet> = lib.get(b"_applet")?;
-        let applet = plugin.applet_ptr();
+        let applet = plugin._applet();
         let applet: gtk4::Box = if !applet.is_null() {
             gtk4::glib::translate::from_glib_full::<_, gtk4::Box>(applet).unsafe_cast()
         } else {
@@ -157,7 +161,7 @@ impl<'a> PluginManager<'a> {
         };
 
         // get css provider
-        let css_provider = plugin.css_provider_ptr();
+        let css_provider = plugin._css_provider();
         let css_provider: CssProvider = if !css_provider.is_null() {
             gtk4::glib::translate::from_glib_full(css_provider)
         } else {
