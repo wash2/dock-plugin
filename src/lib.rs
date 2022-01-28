@@ -13,7 +13,11 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 // A plugin which allows you to add extra functionality to the cosmic dock/panel.
-pub trait Plugin: Any + Send + Sync {
+use std::ffi::c_void;
+use thin_trait_object::*;
+
+#[thin_trait_object(drop_abi = "C")]
+pub trait Plugin {
     /// Get a name describing the `Plugin`.
     fn name(&self) -> &'static str;
     /// Get the applet
@@ -47,88 +51,33 @@ pub trait Plugin: Any + Send + Sync {
     fn on_plugin_unload(&mut self) {}
 }
 
-pub fn get_path_to_xdg_data<T: AsRef<Path>>(name: T) -> Option<PathBuf> {
-    let mut data_dirs = vec![gtk4::glib::user_data_dir()];
-    data_dirs.append(&mut gtk4::glib::system_data_dirs());
-    for mut p in data_dirs {
-        p.push(&name);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-pub fn get_ld_path<T: AsRef<Path>>(lib_name: T) -> Option<PathBuf> {
-    let filename = libloading::library_filename(lib_name.as_ref());
-    let ld_library_dirs: Vec<PathBuf> = std::env::var("LD_LIBRARY_PATH")
-        .map(|dirs| dirs.split(":").map(|s| PathBuf::from(s)).collect())
-        .unwrap_or_default();
-    for mut path in ld_library_dirs {
-        path.push(&filename);
-        if path.exists() {
-            dbg!(&path);
-            return Some(path);
-        }
-    }
-
-    // check output of ldconfig
-    if let Some(Ok(re)) = &filename
-        .to_str()
-        .map(|s| Regex::new(format!(r"\s*{}\s.*=>\s(.+)\s", s).as_str()))
-    {
-        if let Ok(Ok(cap)) = Command::new("ldconfig")
-            .arg("-p")
-            .output()
-            .map(|o| String::from_utf8(o.stdout))
-            .map(|o| {
-                re.captures_iter(&o?)
-                    .next()
-                    .map(|cap| cap[1].to_string())
-                    .ok_or(anyhow!("no match"))
-            })
-        {
-            dbg!(&cap);
-            return Some(cap.into());
-        }
-    }
-    None
-}
-
-/// Declare a plugin type and its constructor.
-///
-/// # Notes
-///
-/// This works by automatically generating an `extern "C"` function with a
-/// pre-defined signature and symbol name. Therefore you will only be able to
-/// declare one plugin per library.
 #[macro_export]
 macro_rules! declare_plugin {
     ($plugin_type:ty) => {
         use gtk4::glib::translate::ToGlibPtr;
         #[no_mangle]
-        pub extern "C" fn _plugin_create() -> *mut dyn $crate::Plugin {
+        pub extern "C" fn _plugin_create() -> *mut std::ffi::c_void {
             // make sure the constructor is the correct type.
             let constructor: fn() -> $plugin_type = <$plugin_type>::default;
 
             let object = constructor();
-            let boxed: std::boxed::Box<dyn $crate::Plugin> = std::boxed::Box::new(object);
-            std::boxed::Box::into_raw(boxed)
+            let boxed_plugin: BoxedPlugin = BoxedPlugin::new(object);
+            boxed_plugin.into_raw() as *mut std::ffi::c_void
         }
     };
 }
 
-pub(crate) struct PluginLibrary {
+pub(crate) struct PluginLibrary<'a> {
     pub(crate) name: String,
     pub(crate) lib_path: OsString,
-    pub(crate) plugin: Box<dyn Plugin>,
+    pub(crate) plugin: BoxedPlugin<'a>,
     pub(crate) css_provider: CssProvider,
     pub(crate) applet: gtk4::Box,
     pub(crate) loaded_library: Library,
 }
 
 /// library should only be unloaded and dropped after no more references tro its applet are being used.
-impl Drop for PluginLibrary {
+impl<'a> Drop for PluginLibrary<'a> {
     fn drop(&mut self) {
         let PluginLibrary {
             name,
@@ -150,14 +99,14 @@ impl Drop for PluginLibrary {
 }
 
 #[derive(Default)]
-pub struct PluginManager {
-    plugins: Vec<PluginLibrary>,
+pub struct PluginManager<'a> {
+    plugins: Vec<PluginLibrary<'a>>,
     watcher: Option<INotifyWatcher>,
     watching: Vec<(String, PathBuf)>,
 }
 
-impl PluginManager {
-    pub fn new() -> (PluginManager, Option<Receiver<notify::Result<Event>>>) {
+impl<'a> PluginManager<'a> {
+    pub fn new() -> (PluginManager<'a>, Option<Receiver<notify::Result<Event>>>) {
         // setup library watcher
         match async_watcher() {
             Ok((watcher, rx)) => (
@@ -192,10 +141,9 @@ impl PluginManager {
         &mut self,
         name: P,
     ) -> Result<(&gtk4::Box, &CssProvider)> {
-        type PluginCreate = unsafe fn() -> *mut dyn Plugin;
+        type PluginCreate<'a> = unsafe fn() -> *mut c_void;
 
         let lib_path = get_ld_path(name.as_ref()).ok_or(anyhow!("library could not be found."))?;
-        dbg!(&lib_path);
         let lib = Library::new(&lib_path)?;
         self.watch_library(&lib_path.parent().unwrap())?;
         // We need to keep the library around otherwise our plugin's vtable will
@@ -204,7 +152,7 @@ impl PluginManager {
         let constructor: Symbol<PluginCreate> = lib.get(b"_plugin_create")?;
         let boxed_raw = constructor();
 
-        let mut plugin = Box::from_raw(boxed_raw);
+        let mut plugin = BoxedPlugin::from_raw(boxed_raw as *mut ());
         debug!("Loaded plugin: {}", plugin.name());
         plugin.on_plugin_load();
 
@@ -305,4 +253,52 @@ fn async_watcher() -> notify::Result<(INotifyWatcher, Receiver<notify::Result<Ev
     })?;
 
     Ok((watcher, rx))
+}
+
+pub fn get_path_to_xdg_data<T: AsRef<Path>>(name: T) -> Option<PathBuf> {
+    let mut data_dirs = vec![gtk4::glib::user_data_dir()];
+    data_dirs.append(&mut gtk4::glib::system_data_dirs());
+    for mut p in data_dirs {
+        p.push(&name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+pub fn get_ld_path<T: AsRef<Path>>(lib_name: T) -> Option<PathBuf> {
+    let filename = libloading::library_filename(lib_name.as_ref());
+    let ld_library_dirs: Vec<PathBuf> = std::env::var("LD_LIBRARY_PATH")
+        .map(|dirs| dirs.split(":").map(|s| PathBuf::from(s)).collect())
+        .unwrap_or_default();
+    for mut path in ld_library_dirs {
+        path.push(&filename);
+        if path.exists() {
+            dbg!(&path);
+            return Some(path);
+        }
+    }
+
+    // check output of ldconfig
+    if let Some(Ok(re)) = &filename
+        .to_str()
+        .map(|s| Regex::new(format!(r"\s*{}\s.*=>\s(.+)\s", s).as_str()))
+    {
+        if let Ok(Ok(cap)) = Command::new("ldconfig")
+            .arg("-p")
+            .output()
+            .map(|o| String::from_utf8(o.stdout))
+            .map(|o| {
+                re.captures_iter(&o?)
+                    .next()
+                    .map(|cap| cap[1].to_string())
+                    .ok_or(anyhow!("no match"))
+            })
+        {
+            dbg!(&cap);
+            return Some(cap.into());
+        }
+    }
+    None
 }

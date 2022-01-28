@@ -17,6 +17,7 @@ libloading = "0.7.3"
 regex = "1.5.4"
 futures = "0.3.19"
 notify = "5.0.0-pre.13"
+thin_trait_object = "1.1.2"
 
 [build-dependencies]
 cbindgen = "0.20.0"
