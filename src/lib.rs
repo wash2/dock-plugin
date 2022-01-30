@@ -83,7 +83,7 @@ impl<'a> Drop for PluginLibrary<'a> {
             applet,
             loaded_library,
         } = self;
-        plugin.on_plugin_unload();
+        plugin._on_plugin_unload();
         drop(applet);
         drop(name);
         drop(filename);
@@ -149,10 +149,9 @@ impl<'a> PluginManager<'a> {
         let boxed_raw = constructor();
 
         let mut plugin = BoxedPlugin::from_raw(boxed_raw as *mut ());
-        plugin.on_plugin_load();
+        plugin._on_plugin_load();
 
         // XXX gtk needs to be initialized before loading applet and css provider
-        // let get_applet: Symbol<GetApplet> = lib.get(b"_applet")?;
         let applet = plugin._applet();
         let applet: gtk4::Box = if !applet.is_null() {
             gtk4::glib::translate::from_glib_full::<_, gtk4::Box>(applet).unsafe_cast()
