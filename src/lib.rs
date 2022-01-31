@@ -3,12 +3,12 @@ use anyhow::{anyhow, Result};
 use futures::{channel::mpsc::Receiver, SinkExt};
 use glib::translate::ToGlibPtr;
 use gtk4::glib::object::Cast;
-use gtk4::prelude::ObjectExt;
 use gtk4::{glib, CssProvider, Orientation};
 use libloading::{Library, Symbol};
 use log::debug;
 use notify::{Event, INotifyWatcher, RecursiveMode, Watcher};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,15 +16,54 @@ use std::process::Command;
 use std::ffi::c_void;
 use thin_trait_object::*;
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum Size {
+    Small,
+    Medium,
+    Large,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum Position {
+    Start,
+    End,
+    Top,
+    Bottom,
+}
+
+impl Default for Position {
+    fn default() -> Self {
+        Self::Bottom
+    }
+}
+
+impl Into<Orientation> for Position {
+    fn into(self) -> Orientation {
+        match self {
+            Self::Start | Self::End => Orientation::Vertical,
+            Self::Top | Self::Bottom => Orientation::Horizontal,
+        }
+    }
+}
+
 #[thin_trait_object(drop_abi = "C")]
 pub trait Plugin {
-    extern "C" fn _applet(&mut self) -> *mut gtk4_sys::GtkBox {
+    extern "C" fn _applet(&self) -> *mut gtk4_sys::GtkBox {
         self.applet().to_glib_full()
     }
-    extern "C" fn _css_provider(&mut self) -> *mut gtk4_sys::GtkCssProvider {
+    extern "C" fn _set_size(&self, size: Size) {
+        self.set_size(size);
+    }
+    extern "C" fn _set_position(&self, position: Position) {
+        self.set_position(position);
+    }
+    extern "C" fn _css_provider(&self) -> *mut gtk4_sys::GtkCssProvider {
         self.css_provider().to_glib_full()
     }
     extern "C" fn _on_plugin_load(&mut self) {
+        gtk4::init().unwrap();
         self.on_plugin_load();
     }
     extern "C" fn _on_plugin_unload(&mut self) {
@@ -32,19 +71,19 @@ pub trait Plugin {
     }
 
     /// Get the applet
-    fn applet(&mut self) -> gtk4::Box;
+    fn applet(&self) -> gtk4::Box;
     /// get the css provider
-    fn css_provider(&mut self) -> CssProvider {
+    fn css_provider(&self) -> CssProvider {
         CssProvider::new()
     }
+    fn set_size(&self, size: Size);
+    fn set_position(&self, position: Position);
     /// A callback fired immediately after the plugin is loaded. Usually used
     /// for initialization.
-    fn on_plugin_load(&mut self) {
-        gtk4::init().unwrap();
-    }
+    fn on_plugin_load(&mut self);
     /// A callback fired immediately before the plugin is unloaded. Use this if
     /// you need to do any cleanup.
-    fn on_plugin_unload(&mut self) {}
+    fn on_plugin_unload(&mut self);
 }
 
 #[macro_export]
@@ -96,7 +135,7 @@ impl<'a> Drop for PluginLibrary<'a> {
 
 #[derive(Default)]
 pub struct PluginManager<'a> {
-    plugins: Vec<PluginLibrary<'a>>,
+    libraries: Vec<PluginLibrary<'a>>,
     watcher: Option<INotifyWatcher>,
     watching: Vec<(String, PathBuf)>,
 }
@@ -107,7 +146,7 @@ impl<'a> PluginManager<'a> {
         match async_watcher() {
             Ok((watcher, rx)) => (
                 PluginManager {
-                    plugins: Vec::new(),
+                    libraries: Vec::new(),
                     watcher: Some(watcher),
                     ..Default::default()
                 },
@@ -122,14 +161,14 @@ impl<'a> PluginManager<'a> {
 
     /// library should only be unloaded and dropped after no more references to its applet are being used.
     pub unsafe fn unload_plugin<P: AsRef<OsStr>>(&mut self, lib_path: P) {
-        if let Some(i) = self.plugins.iter().enumerate().find_map(|(i, p)| {
+        if let Some(i) = self.libraries.iter().enumerate().find_map(|(i, p)| {
             if p.lib_path == lib_path.as_ref() {
                 Some(i)
             } else {
                 None
             }
         }) {
-            self.plugins.remove(i);
+            self.libraries.remove(i);
         }
     }
 
@@ -167,7 +206,7 @@ impl<'a> PluginManager<'a> {
             CssProvider::new()
         };
 
-        self.plugins.push(PluginLibrary {
+        self.libraries.push(PluginLibrary {
             name: name.clone().into(),
             lib_path: lib_path.clone().into(),
             plugin,
@@ -180,7 +219,7 @@ impl<'a> PluginManager<'a> {
             applet,
             css_provider,
             ..
-        } = self.plugins.last().unwrap();
+        } = self.libraries.last().unwrap();
 
         Ok((applet, css_provider))
     }
@@ -190,7 +229,7 @@ impl<'a> PluginManager<'a> {
     /// library should only be unloaded and dropped after no more references to its applet are being used.
     pub fn unload_all(&mut self) {
         debug!("Unloading plugins");
-        for p in self.plugins.drain(..) {
+        for p in self.libraries.drain(..) {
             drop(p);
         }
         if let Some(watcher) = self.watcher.as_mut() {
@@ -201,13 +240,29 @@ impl<'a> PluginManager<'a> {
     }
 
     pub fn paths(&self) -> Vec<OsString> {
-        self.plugins.iter().map(|p| p.lib_path.clone()).collect()
+        self.libraries.iter().map(|l| l.lib_path.clone()).collect()
+    }
+
+    pub fn applets(&self) -> Vec<&gtk4::Box> {
+        self.libraries.iter().map(|l| &l.applet).collect()
+    }
+
+    pub fn set_size(&self, size: Size) {
+        for l in &self.libraries {
+            l.plugin._set_size(size);
+        }
+    }
+
+    pub fn set_position(&self, p: Position) {
+        for l in &self.libraries {
+            l.plugin._set_position(p);
+        }
     }
 
     pub fn library_path_to_applet<T: AsRef<OsStr>>(&self, lib_filename: T) -> Option<&gtk4::Box> {
-        self.plugins.iter().find_map(move |p| {
-            if p.lib_path.as_os_str() == lib_filename.as_ref() {
-                Some(&p.applet)
+        self.libraries.iter().find_map(move |l| {
+            if l.lib_path.as_os_str() == lib_filename.as_ref() {
+                Some(&l.applet)
             } else {
                 None
             }
